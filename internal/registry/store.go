@@ -16,6 +16,14 @@ var ErrVersionConflict = errors.New("version already exists with different conte
 // ErrNotFound is returned for unknown packages, versions or consumers.
 var ErrNotFound = errors.New("not found")
 
+// ErrConcurrentModification is returned when an exemption state
+// transition presents a stale optimistic-concurrency version.
+var ErrConcurrentModification = errors.New("exemption was modified concurrently; re-read and retry")
+
+// ErrInvalidStateTransition is returned when an exemption is not in the
+// state the operation requires (e.g. approving an already-rejected one).
+var ErrInvalidStateTransition = errors.New("invalid exemption state transition")
+
 // Version is one immutable registered schema version.
 type Version struct {
 	Package       string
@@ -60,7 +68,44 @@ type Store interface {
 	ListVersions(ctx context.Context, pkg string) ([]Version, error)
 
 	PutReport(ctx context.Context, rep StoredReport) error
+	// GetReport returns the most recently stored report for a
+	// (package, base, head) tuple.
+	GetReport(ctx context.Context, pkg, base, head string) (*StoredReport, error)
 
 	UpsertConsumer(ctx context.Context, decl ConsumerDecl) error
 	GetConsumer(ctx context.Context, pkg, consumer string) (*ConsumerDecl, error)
+
+	// CreateExemption stores a PENDING exemption and its REQUESTED audit
+	// event atomically. Idempotency is enforced by (package, fingerprint,
+	// requested_by) while the request is still open: a repeat request
+	// returns the existing row with created=false.
+	CreateExemption(ctx context.Context, e Exemption) (ex *Exemption, created bool, err error)
+	GetExemption(ctx context.Context, id int64) (*Exemption, error)
+	// ListExemptions returns the package's exemptions, newest first. When
+	// fingerprint is non-empty only that finding's exemptions are returned.
+	ListExemptions(ctx context.Context, pkg, fingerprint string) ([]Exemption, error)
+
+	// TransitionExemption applies one optimistic-concurrency state move.
+	// It succeeds only when the stored row is still at expectedVersion and
+	// in state expectFrom; then it sets the fields given in want, bumps the
+	// version and appends one audit event — all in one transaction.
+	TransitionExemption(ctx context.Context, id, expectedVersion int64, expectFrom ExemptionStatus, want ExemptionPatch, event AuditEvent) (*Exemption, error)
+
+	// ActiveExemptionsForPackage returns every APPROVED exemption in the
+	// package (expiry is judged at query time by the service).
+	ActiveExemptionsForPackage(ctx context.Context, pkg string) ([]Exemption, error)
+
+	// ListAuditEvents returns a package's exemption audit trail, oldest
+	// first, optionally narrowed to one exemption.
+	ListAuditEvents(ctx context.Context, pkg string, exemptionID int64) ([]AuditEvent, error)
+}
+
+// ExemptionPatch carries the columns a transition writes. Fields left
+// zero-valued are untouched (apart from state, which is always required).
+type ExemptionPatch struct {
+	Status     ExemptionStatus
+	ApprovedBy string
+	RejectedBy string
+	RevokedBy  string
+	DecidedAt  *time.Time
 }

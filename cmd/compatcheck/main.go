@@ -2,6 +2,7 @@
 //
 //	compatcheck run <cases-dir>                      run regression cases
 //	compatcheck check -old <dir> -new <dir>          ad-hoc comparison, JSON report
+//	compatcheck exemption <action> [flags]           manage time-bounded waivers
 //
 // Regression cases live in directories with old/ and new/ proto trees and
 // a case.json expectation file; see testdata/cases.
@@ -29,6 +30,8 @@ func main() {
 		os.Exit(runCases(os.Args[2:]))
 	case "check":
 		os.Exit(checkTrees(os.Args[2:]))
+	case "exemption", "waive":
+		os.Exit(exemptionCmd(os.Args[2:]))
 	default:
 		usage()
 		os.Exit(2)
@@ -40,6 +43,9 @@ func usage() {
   compatcheck run <cases-dir>                 run all regression cases under a directory
   compatcheck check -old DIR -new DIR [-samples FILE.json] [-format json|text]
                                               compare two proto trees directly
+  compatcheck exemption request|approve|reject|revoke|get|list|audit [flags]
+                                              manage finding exemptions against a registry server
+                                              (-server http://host:8080, identity via -actor / REGISTRY_ACTOR)
 `)
 }
 

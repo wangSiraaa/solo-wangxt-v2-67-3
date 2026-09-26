@@ -6,11 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"connectrpc.com/connect"
 
 	"protocompat/internal/compat"
 	"protocompat/internal/schema"
+
+	"google.golang.org/protobuf/reflect/protoregistry"
 )
 
 // Service implements the registry API. It is pure backend: schema parsing
@@ -18,10 +21,12 @@ import (
 // (via Store) holds packages, versions and consumer declarations.
 type Service struct {
 	store Store
+	// now is the clock; overridable in tests for expiry-boundary cases.
+	now func() time.Time
 }
 
 func NewService(store Store) *Service {
-	return &Service{store: store}
+	return &Service{store: store, now: time.Now}
 }
 
 // RegisterVersion compiles the submitted sources, refuses to overwrite an
@@ -43,12 +48,34 @@ func (s *Service) RegisterVersion(ctx context.Context, req *connect.Request[Regi
 	base, baseErr := s.resolveBase(ctx, r.Package, r.Version, r.BaseVersion)
 
 	var report *compat.Report
+	var oldC, newC *schema.Compiled
+	var gateDecision *ConsumerDecisionView
 	if baseErr == nil && base != nil {
-		report, err = s.checkAgainst(ctx, base, compiled, r.Samples)
-		if err != nil {
-			return nil, err
+		var err2 error
+		report, oldC, err2 = s.checkAgainst(ctx, base, compiled, r.Samples)
+		if err2 != nil {
+			return nil, err2
 		}
-		if r.RequireCompatible && report.Verdict == compat.VerdictIncompatible {
+		newC = compiled
+
+		// The publish gate is consumer-scoped: only a named consumer can
+		// benefit from its granted exemptions. Without a consumer the raw
+		// evidence verdict stands.
+		if r.Consumer != "" {
+			decision, derr := s.consumerDecision(ctx, r.Package, r.Consumer, report, oldC.Files, newC.Files)
+			if derr != nil {
+				return nil, derr
+			}
+			gateDecision = decision
+		}
+		gateVerdict := report.Verdict
+		if gateDecision != nil {
+			gateVerdict = compat.Verdict(gateDecision.Verdict)
+			if gateDecision.Verdict == PublishExempted {
+				gateVerdict = compat.VerdictCompatible
+			}
+		}
+		if r.RequireCompatible && gateVerdict == compat.VerdictIncompatible {
 			return nil, connect.NewError(connect.CodeFailedPrecondition,
 				fmt.Errorf("version %s is proven incompatible with %s (%d FAIL findings); registration refused, nothing stored",
 					r.Version, base.Version, countSeverity(report, compat.SeverityFail)))
@@ -86,6 +113,25 @@ func (s *Service) RegisterVersion(ctx context.Context, req *connect.Request[Regi
 	if base != nil {
 		resp.BaseVersion = base.Version
 	}
+	if report != nil {
+		view := buildReportView(r.Package, report, compat.SourceLines(report, oldC.Files, newC.Files))
+		resp.Report = view
+		if gateDecision != nil {
+			resp.Publish = &PublishDecisionView{
+				Consumer:   r.Consumer,
+				RawVerdict: gateDecision.RawVerdict,
+				Verdict:    gateDecision.Verdict,
+				Findings:   gateDecision.Findings,
+				Exemptions: gateDecision.Exemptions,
+			}
+		} else {
+			resp.Publish = &PublishDecisionView{
+				RawVerdict: report.Verdict,
+				Verdict:    PublishVerdict(report.Verdict),
+				Findings:   view.Findings,
+			}
+		}
+	}
 	return connect.NewResponse(resp), nil
 }
 
@@ -111,6 +157,7 @@ func (s *Service) CheckCompatibility(ctx context.Context, req *connect.Request[C
 
 	var headVersion string
 	var report *compat.Report
+	var oldC, newC *schema.Compiled
 	if r.CandidateVersion != "" {
 		head, err := s.store.GetVersion(ctx, r.Package, r.CandidateVersion)
 		if errors.Is(err, ErrNotFound) {
@@ -120,17 +167,21 @@ func (s *Service) CheckCompatibility(ctx context.Context, req *connect.Request[C
 			return nil, connect.NewError(connect.CodeInternal, err)
 		}
 		headVersion = head.Version
-		report, err = checkVersions(base, head, r.Samples)
+		report, oldC, newC, err = checkDescriptors(base, head, r.Samples)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		compiled, cerr := schema.Compile(ctx, r.CandidateFiles)
 		if cerr != nil {
 			return nil, connect.NewError(connect.CodeInvalidArgument, cerr)
 		}
 		headVersion = "(unregistered candidate)"
-		report, err = s.checkAgainst(ctx, base, compiled, r.Samples)
-	}
-	if err != nil {
-		return nil, err
+		report, oldC, cerr = s.checkAgainst(ctx, base, compiled, r.Samples)
+		if cerr != nil {
+			return nil, cerr
+		}
+		newC = compiled
 	}
 
 	if r.CandidateVersion != "" {
@@ -139,13 +190,25 @@ func (s *Service) CheckCompatibility(ctx context.Context, req *connect.Request[C
 		})
 	}
 
-	resp := &CheckResponse{BaseVersion: base.Version, HeadVersion: headVersion, Report: report}
+	resp := &CheckResponse{
+		BaseVersion: base.Version,
+		HeadVersion: headVersion,
+		Report:      report,
+		Annotated:   buildReportView(r.Package, report, compat.SourceLines(report, oldC.Files, newC.Files)),
+	}
 	if r.Consumer != "" {
+		// Keep the legacy projection for backward compatibility...
 		impact, err := s.consumerImpact(ctx, r.Package, r.Consumer, report)
 		if err != nil {
 			return nil, err
 		}
 		resp.ConsumerImpact = impact
+		// ...and return the exemption-aware decision alongside it.
+		decision, derr := s.consumerDecision(ctx, r.Package, r.Consumer, report, oldC.Files, newC.Files)
+		if derr != nil {
+			return nil, derr
+		}
+		resp.ConsumerDecision = decision
 	}
 	return connect.NewResponse(resp), nil
 }
@@ -219,31 +282,37 @@ func (s *Service) resolveBase(ctx context.Context, pkg, newVersion, requested st
 }
 
 // checkAgainst runs the compat check between a stored base version and a
-// freshly compiled candidate.
-func (s *Service) checkAgainst(_ context.Context, base *Version, candidate *schema.Compiled, samples []compat.Sample) (*compat.Report, error) {
+// freshly compiled candidate. It also returns the linked descriptor
+// registries used, so callers can resolve presentation-only source lines.
+func (s *Service) checkAgainst(_ context.Context, base *Version, candidate *schema.Compiled, samples []compat.Sample) (*compat.Report, *schema.Compiled, error) {
 	oldFiles, err := schema.Load(base.DescriptorSet)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("load base descriptors: %w", err))
+		return nil, nil, connect.NewError(connect.CodeInternal, fmt.Errorf("load base descriptors: %w", err))
 	}
 	owned := unionStrings(base.OwnedPaths, candidate.OwnedPaths)
-	return compat.Check(compat.Input{
+	report := compat.Check(compat.Input{
 		Old: oldFiles, New: candidate.Files, OwnedPaths: owned, Samples: samples,
-	}), nil
+	})
+	c := &schema.Compiled{Files: oldFiles}
+	return report, c, nil
 }
 
-func checkVersions(base, head *Version, samples []compat.Sample) (*compat.Report, error) {
+// checkDescriptors loads both stored versions and returns their linked
+// registries alongside the report.
+func checkDescriptors(base, head *Version, samples []compat.Sample) (*compat.Report, *schema.Compiled, *schema.Compiled, error) {
 	oldFiles, err := schema.Load(base.DescriptorSet)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("load base descriptors: %w", err))
+		return nil, nil, nil, connect.NewError(connect.CodeInternal, fmt.Errorf("load base descriptors: %w", err))
 	}
 	newFiles, err := schema.Load(head.DescriptorSet)
 	if err != nil {
-		return nil, connect.NewError(connect.CodeInternal, fmt.Errorf("load head descriptors: %w", err))
+		return nil, nil, nil, connect.NewError(connect.CodeInternal, fmt.Errorf("load head descriptors: %w", err))
 	}
 	owned := unionStrings(base.OwnedPaths, head.OwnedPaths)
-	return compat.Check(compat.Input{
+	report := compat.Check(compat.Input{
 		Old: oldFiles, New: newFiles, OwnedPaths: owned, Samples: samples,
-	}), nil
+	})
+	return report, &schema.Compiled{Files: oldFiles}, &schema.Compiled{Files: newFiles}, nil
 }
 
 // consumerImpact projects a report onto a consumer's declared surface:
@@ -275,6 +344,50 @@ func (s *Service) consumerImpact(ctx context.Context, pkg, consumer string, repo
 		}
 	}
 	return impact, nil
+}
+
+// consumerDecision is the exemption-aware projection: it loads the
+// consumer's declaration, lazily expires any due exemptions (writing the
+// audit transitions), annotates findings with active waivers and returns
+// both the raw verdict and the waiver-adjusted publish verdict.
+func (s *Service) consumerDecision(ctx context.Context, pkg, consumer string, report *compat.Report, oldFiles, newFiles *protoregistry.Files) (*ConsumerDecisionView, error) {
+	decl, err := s.store.GetConsumer(ctx, pkg, consumer)
+	if errors.Is(err, ErrNotFound) {
+		return nil, connect.NewError(connect.CodeNotFound, fmt.Errorf("consumer %q has no declaration for package %s", consumer, pkg))
+	}
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	active, err := s.store.ActiveExemptionsForPackage(ctx, pkg)
+	if err != nil {
+		return nil, connect.NewError(connect.CodeInternal, err)
+	}
+	now := s.now()
+	active = s.sweepExpired(ctx, active, now)
+
+	view := buildReportView(pkg, report, compat.SourceLines(report, oldFiles, newFiles))
+	projected := s.projectFindings(consumer, view, decl, exemptionPtrs(active), now)
+	raw, publish, applied := publishDecision(projected)
+
+	out := &ConsumerDecisionView{
+		Consumer:   consumer,
+		Encoding:   decl.Encoding,
+		RawVerdict: raw,
+		Verdict:    publish,
+		Exemptions: applied,
+	}
+	for _, p := range projected {
+		out.Findings = append(out.Findings, p.finding)
+	}
+	return out, nil
+}
+
+func exemptionPtrs(list []Exemption) []*Exemption {
+	out := make([]*Exemption, len(list))
+	for i := range list {
+		out[i] = &list[i]
+	}
+	return out
 }
 
 func dimensionRelevant(encoding string, dim compat.Dimension) bool {

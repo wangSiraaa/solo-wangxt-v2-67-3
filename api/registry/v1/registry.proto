@@ -28,6 +28,34 @@ service Registry {
 
   // ListVersions returns every registered version of a package.
   rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+
+  // RequestExemption files a time-bounded, consumer-scoped waiver for one
+  // deterministic finding in a stored report. The report is never
+  // rewritten; the exemption only changes the derived publish verdict.
+  // A repeated open request by the same requester for the same finding
+  // is idempotent.
+  rpc RequestExemption(RequestExemptionRequest) returns (ExemptionResponse);
+
+  // ApproveExemption moves a PENDING exemption to APPROVED. The actor
+  // must differ from requested_by (self-approval is denied). Approving an
+  // already-approved exemption is idempotent.
+  rpc ApproveExemption(ApproveExemptionRequest) returns (ExemptionResponse);
+
+  // RejectExemption refuses a PENDING exemption (terminal).
+  rpc RejectExemption(RejectExemptionRequest) returns (ExemptionResponse);
+
+  // RevokeExemption withdraws an APPROVED exemption early (terminal);
+  // blocking resumes on the next query.
+  rpc RevokeExemption(RevokeExemptionRequest) returns (ExemptionResponse);
+
+  // GetExemption fetches one exemption (including its version token).
+  rpc GetExemption(GetExemptionRequest) returns (ExemptionResponse);
+
+  // ListExemptions lists a package's exemptions, optionally by fingerprint.
+  rpc ListExemptions(ListExemptionsRequest) returns (ListExemptionsResponse);
+
+  // ListAuditEvents returns the append-only exemption audit trail.
+  rpc ListAuditEvents(ListAuditEventsRequest) returns (ListAuditEventsResponse);
 }
 
 message ProtoFile {
@@ -51,6 +79,49 @@ message Finding {
   string detail = 6;
 }
 
+// FindingView augments a raw finding with its position-independent
+// fingerprint and a presentation-only source line.
+message FindingView {
+  Finding finding = 1;
+  int32 line = 2;                  // 1-based source line; 0 if unresolved
+  string fingerprint = 3;          // stable identity for exemptions
+  ExemptionRef exemption = 4;      // present when an active waiver applies
+}
+
+message ExemptionRef {
+  int64 id = 1;
+  string owner = 2;
+  string requested_by = 3;
+  string approved_by = 4;
+  string expires_at = 5;
+  string reason = 6;
+}
+
+message ReportView {
+  string verdict = 1;
+  repeated FindingView findings = 2;
+}
+
+// PublishDecision is the release verdict after exemptions. EXEMPTED means
+// raw evidence blocks but every blocking finding is waived for this
+// consumer.
+message PublishDecision {
+  string consumer = 1;
+  string raw_verdict = 2;   // COMPATIBLE | NEEDS_REVIEW | INCOMPATIBLE
+  string verdict = 3;       // COMPATIBLE | NEEDS_REVIEW | INCOMPATIBLE | EXEMPTED
+  repeated FindingView findings = 4;
+  repeated int64 applied_exemption_ids = 5;
+}
+
+message ConsumerDecision {
+  string consumer = 1;
+  string encoding = 2;
+  string raw_verdict = 3;
+  string verdict = 4;
+  repeated FindingView findings = 5;
+  repeated int64 applied_exemption_ids = 6;
+}
+
 message Report {
   string verdict = 1; // COMPATIBLE | NEEDS_REVIEW | INCOMPATIBLE
   repeated Finding findings = 2;
@@ -63,6 +134,7 @@ message RegisterVersionRequest {
   string base_version = 4;          // default: latest registered
   repeated Sample samples = 5;
   bool require_compatible = 6;
+  string consumer = 7;              // scope the gate (and exemptions) to a consumer
 }
 
 message RegisterVersionResponse {
@@ -71,7 +143,9 @@ message RegisterVersionResponse {
   string content_hash = 3;
   bool already_existed = 4;
   string base_version = 5;
-  Report compatibility = 6;
+  Report compatibility = 6;         // raw immutable report
+  PublishDecision publish = 7;      // raw + exemption-adjusted release verdict
+  ReportView report = 8;            // same report annotated with fingerprints/lines
 }
 
 message CheckRequest {
@@ -88,6 +162,7 @@ message CheckResponse {
   string head_version = 2;
   Report report = 3;
   ConsumerImpact consumer_impact = 4;
+  ConsumerDecision consumer_decision = 5; // exemption-aware projection
 }
 
 message ConsumerImpact {
@@ -126,4 +201,100 @@ message VersionMeta {
 message ListVersionsResponse {
   string package = 1;
   repeated VersionMeta versions = 2;
+}
+
+// --- exemptions ---
+
+message RequestExemptionRequest {
+  string package = 1;
+  string base_version = 2;
+  string head_version = 3;
+  string fingerprint = 4;             // or:
+  optional int32 finding_index = 5;   // 0-based index into the stored report
+  string owner = 6;                   // responsible person
+  string reason = 7;
+  repeated string consumers = 8;      // scope: never global
+  string requested_by = 9;            // applicant identity (or X-Actor)
+  string expires_at = 10;             // RFC3339; waiver in force strictly before
+}
+
+message Exemption {
+  int64 id = 1;
+  string package = 2;
+  string base_version = 3;
+  string head_version = 4;
+  string fingerprint = 5;
+  string original_severity = 6;
+  string owner = 7;
+  string reason = 8;
+  repeated string consumers = 9;
+  string requested_by = 10;
+  string status = 11;      // PENDING | APPROVED | REJECTED | REVOKED | EXPIRED
+  string approved_by = 12;
+  string rejected_by = 13;
+  string revoked_by = 14;
+  string expires_at = 15;
+  string decided_at = 16;
+  string created_at = 17;
+  int64 version = 18;      // optimistic-concurrency token
+}
+
+message ExemptionResponse {
+  Exemption exemption = 1;
+  bool already_existed = 2;
+}
+
+message ApproveExemptionRequest {
+  int64 id = 1;
+  int64 expected_version = 2;
+  string actor = 3;
+}
+
+message RejectExemptionRequest {
+  int64 id = 1;
+  int64 expected_version = 2;
+  string actor = 3;
+}
+
+message RevokeExemptionRequest {
+  int64 id = 1;
+  int64 expected_version = 2;
+  string actor = 3;
+  string reason = 4;
+}
+
+message GetExemptionRequest {
+  int64 id = 1;
+}
+
+message ListExemptionsRequest {
+  string package = 1;
+  string fingerprint = 2;
+}
+
+message ListExemptionsResponse {
+  string package = 1;
+  repeated Exemption exemptions = 2;
+}
+
+message AuditEvent {
+  int64 id = 1;
+  int64 exemption_id = 2;
+  string action = 3;      // REQUESTED | APPROVED | REJECTED | REVOKED | EXPIRED
+  string actor = 4;
+  string from_state = 5;
+  string to_state = 6;
+  int64 version = 7;
+  string detail = 8;
+  string created_at = 9;
+}
+
+message ListAuditEventsRequest {
+  string package = 1;
+  int64 exemption_id = 2;
+}
+
+message ListAuditEventsResponse {
+  string package = 1;
+  repeated AuditEvent events = 2;
 }

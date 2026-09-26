@@ -13,6 +13,14 @@ const (
 	ProcedureCheckCompatibility = "/registry.v1.Registry/CheckCompatibility"
 	ProcedureDeclareConsumer    = "/registry.v1.Registry/DeclareConsumer"
 	ProcedureListVersions       = "/registry.v1.Registry/ListVersions"
+
+	ProcedureRequestExemption = "/registry.v1.Registry/RequestExemption"
+	ProcedureApproveExemption = "/registry.v1.Registry/ApproveExemption"
+	ProcedureRejectExemption  = "/registry.v1.Registry/RejectExemption"
+	ProcedureRevokeExemption  = "/registry.v1.Registry/RevokeExemption"
+	ProcedureGetExemption     = "/registry.v1.Registry/GetExemption"
+	ProcedureListExemptions   = "/registry.v1.Registry/ListExemptions"
+	ProcedureListAuditEvents  = "/registry.v1.Registry/ListAuditEvents"
 )
 
 // jsonCodec speaks application/json for plain Go structs, so the service
@@ -37,5 +45,20 @@ func (s *Service) Handler() (string, http.Handler) {
 		ProcedureDeclareConsumer, s.DeclareConsumer, connect.WithCodec(jsonCodec{})))
 	mux.Handle(ProcedureListVersions, connect.NewUnaryHandler(
 		ProcedureListVersions, s.ListVersions, connect.WithCodec(jsonCodec{})))
+
+	mux.Handle(ProcedureRequestExemption, connect.NewUnaryHandler(
+		ProcedureRequestExemption, s.RequestExemption, connect.WithCodec(jsonCodec{})))
+	mux.Handle(ProcedureApproveExemption, connect.NewUnaryHandler(
+		ProcedureApproveExemption, s.ApproveExemption, connect.WithCodec(jsonCodec{})))
+	mux.Handle(ProcedureRejectExemption, connect.NewUnaryHandler(
+		ProcedureRejectExemption, s.RejectExemption, connect.WithCodec(jsonCodec{})))
+	mux.Handle(ProcedureRevokeExemption, connect.NewUnaryHandler(
+		ProcedureRevokeExemption, s.RevokeExemption, connect.WithCodec(jsonCodec{})))
+	mux.Handle(ProcedureGetExemption, connect.NewUnaryHandler(
+		ProcedureGetExemption, s.GetExemptionRPC, connect.WithCodec(jsonCodec{})))
+	mux.Handle(ProcedureListExemptions, connect.NewUnaryHandler(
+		ProcedureListExemptions, s.ListExemptionsRPC, connect.WithCodec(jsonCodec{})))
+	mux.Handle(ProcedureListAuditEvents, connect.NewUnaryHandler(
+		ProcedureListAuditEvents, s.ListAuditEventsRPC, connect.WithCodec(jsonCodec{})))
 	return "/registry.v1.Registry/", mux
 }
