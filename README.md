@@ -10,9 +10,10 @@
 ```
 cmd/server        ConnectRPC 服务入口（纯后端，无管理页面）
 cmd/compatcheck   命令行：回归用例运行器 + 两棵 proto 树的临时比对
+cmd/registryctl   命令行：豁免申请/批准/撤销/查询 + 带发布判定的检查
 internal/schema   protocompile 封装：编译 → 描述符集 → 内容哈希 → 重新加载
 internal/compat   兼容性判定核心（字段号复用 / 保留删除 / 类型变化 / 枚举默认值 / 样例载荷）
-internal/registry ConnectRPC 处理器、Store 接口、PostgreSQL 实现、内存实现
+internal/registry ConnectRPC 处理器、Store 接口、PostgreSQL 实现、内存实现、豁免工作流
 internal/regress  文件型回归用例运行器（CLI 与 go test 共用）
 testdata/cases    回归案例：嵌套导入、oneof 迁移、同名不同包……
 api/registry/v1   服务契约（ConnectRPC，当前手写 handler + JSON codec，无需 codegen）
@@ -20,10 +21,12 @@ api/registry/v1   服务契约（ConnectRPC，当前手写 handler + JSON codec�
 
 - **解析**：`github.com/bufbuild/protocompile`，嵌套导入、菱形导入、well-known
   types 均由编译器解析；判断在 `protoreflect` 描述符上进行。
-- **传输**：ConnectRPC（connect 协议 + JSON codec），四个方法：
-  `RegisterVersion` / `CheckCompatibility` / `DeclareConsumer` / `ListVersions`。
+- **传输**：ConnectRPC（connect 协议 + JSON codec），八个方法：
+  `RegisterVersion` / `CheckCompatibility` / `DeclareConsumer` / `ListVersions`
+  / `RequestExemption` / `ApproveExemption` / `RevokeExemption` / `ListExemptions`。
 - **存储**：PostgreSQL 存包、不可变版本（描述符集 + 内容哈希）、兼容性报告、
-  使用方声明（consumer declarations）。`STORE=memory` 可本地冒烟（不持久化）。
+  使用方声明（consumer declarations）、豁免及其审计事件。`STORE=memory`
+  可本地冒烟（不持久化）。
 
 ## 判定模型
 
@@ -58,6 +61,61 @@ api/registry/v1   服务契约（ConnectRPC，当前手写 handler + JSON codec�
 消费方声明自己读取的消息/字段与编码（wire/json/both），`CheckCompatibility`
 带上 `consumer` 后，报告会投影到该消费方的实际使用面：wire-only 消费者不受
 纯 JSON 破坏影响，反之亦然。
+
+## 有时效的豁免（exemption）
+
+某些破坏是有意为之且有迁移窗口的。调用方可针对**某一已存报告中的确定
+finding** 申请豁免：填写负责人（owner）、原因、适用消费方与到期时间
+（RFC3339）。豁免经**另一身份**批准后才生效——申请人不能自批
+（`permission_denied`）。
+
+- **指纹匹配**：finding 的语义指纹由其严重级别、规则 code、维度、消息与
+  字段路径决定（不含散文 detail）。源码行号平移不改变指纹，豁免随之延续到
+  新报告；规则或对象变化产生新指纹，必须重新申请。
+- **双重结论**：`CheckCompatibility` / `RegisterVersion` 同时返回原始报告
+  （绝不改写）与 `release` 发布判定（`raw_verdict` + `effective_verdict` +
+  每条 finding 的豁免结果）。豁免只在列出的消费方上生效；`"*"` 覆盖所有
+  消费方与不带 consumer 的全局判定。
+- **立即恢复阻断**：过期（到达 `expires_at` 边界）、撤销或指纹变化都会在
+  下一次查询立即恢复阻断。`EXPIRED` 是读取时推导的状态，不落库、不需要
+  后台任务；历史报告行也从不更新。
+- **乐观并发与审计**：所有状态迁移（申请/批准/撤销）都以 `version` 做乐观
+  并发控制，并在同一事务里写入 PostgreSQL 审计事件（`exemption_events`）。
+  基于同一旧版本并发审批只有一个成功（`aborted`/`failed_precondition`）；
+  同一审批者重复审批是幂等成功；`request_id` 让申请重试幂等。
+- **发布门禁**：`require_compatible` 门禁看的是全局（无 consumer）上下文
+  的 `effective_verdict`——只有 `"*"` 豁免能放行，消费方级豁免不会。
+
+```bash
+# 1. 查出 finding 指纹（release.findings[].fingerprint）
+curl -s localhost:8080/registry.v1.Registry/CheckCompatibility -H 'Content-Type: application/json' -d '{
+  "package": "acme.pay", "base_version": "v1", "candidate_version": "v2", "consumer": "ledger"
+}'
+# 2. 申请豁免（PENDING，此时无任何效果）
+curl -s localhost:8080/registry.v1.Registry/RequestExemption -H 'Content-Type: application/json' -d '{
+  "package": "acme.pay", "base_version": "v1", "head_version": "v2",
+  "fingerprint": "<fp>", "owner": "team-pay", "reason": "ledger 迁移窗口",
+  "consumers": ["ledger"], "expires_at": "2026-10-25T00:00:00Z", "requested_by": "alice",
+  "request_id": "req-2026-09-25-1"
+}'
+# 3. 另一身份批准（携带读到的 version 做乐观并发）
+curl -s localhost:8080/registry.v1.Registry/ApproveExemption -H 'Content-Type: application/json' -d '{
+  "id": "ex_...", "expected_version": 1, "approver": "bob"
+}'
+# 撤销同理：RevokeExemption；查看：ListExemptions（include_inactive 含历史）
+```
+
+CLI 等价物（无页面，纯命令行）：
+
+```bash
+registryctl -addr http://localhost:8080 check   -pkg acme.pay -base v1 -head v2 -consumer ledger
+registryctl -addr http://localhost:8080 request -pkg acme.pay -base v1 -head v2 \
+    -fingerprint <fp> -owner team-pay -reason "迁移窗口" \
+    -consumer ledger -expires 2026-10-25T00:00:00Z -by alice -request-id req-1
+registryctl -addr http://localhost:8080 approve -id ex_... -version 1 -by bob
+registryctl -addr http://localhost:8080 revoke  -id ex_... -version 2 -by carol -reason "不再接受"
+registryctl -addr http://localhost:8080 list    -pkg acme.pay [-all]
+```
 
 ## 运行
 

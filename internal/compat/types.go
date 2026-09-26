@@ -6,6 +6,12 @@
 // keeps the overall verdict at NEEDS_REVIEW instead of COMPATIBLE.
 package compat
 
+import (
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
+)
+
 // Severity ranks a single finding.
 type Severity string
 
@@ -59,6 +65,23 @@ type Finding struct {
 	Detail string `json:"detail"`
 }
 
+// Fingerprint is the semantic identity of a finding. It is computed from
+// the structured fields only — severity, rule code, dimension, message and
+// field path — and deliberately excludes the human-readable detail prose.
+// Reordering source lines or rewording a message keeps the fingerprint;
+// a change to the rule that fired or the object it fired on produces a new
+// one, which is what exemption matching relies on.
+func (f Finding) Fingerprint() string {
+	h := sha256.New()
+	for _, s := range []string{string(f.Severity), f.Code, string(f.Dimension), f.Message, f.Path} {
+		var lenBuf [4]byte
+		binary.BigEndian.PutUint32(lenBuf[:], uint32(len(s)))
+		h.Write(lenBuf[:])
+		h.Write([]byte(s))
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
 // Report is the outcome of comparing an old descriptor set with a new one.
 type Report struct {
 	Verdict  Verdict        `json:"verdict"`
@@ -95,8 +118,8 @@ type Diff struct {
 	New  string `json:"new"`
 }
 
-// verdictOf aggregates findings into a verdict.
-func verdictOf(findings []Finding) Verdict {
+// VerdictOf aggregates findings into a verdict.
+func VerdictOf(findings []Finding) Verdict {
 	v := VerdictCompatible
 	for _, f := range findings {
 		switch f.Severity {

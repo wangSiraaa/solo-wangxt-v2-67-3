@@ -38,7 +38,7 @@ func Check(in Input) *Report {
 		c.findings = append(c.findings, sampleFindings(rep.Samples)...)
 	}
 	rep.Findings = c.findings
-	rep.Verdict = verdictOf(c.findings)
+	rep.Verdict = VerdictOf(c.findings)
 	return rep
 }
 

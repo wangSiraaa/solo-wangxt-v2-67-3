@@ -25,6 +25,10 @@ type RegisterVersionResponse struct {
 	AlreadyExisted bool           `json:"already_existed"`
 	BaseVersion    string         `json:"base_version,omitempty"`
 	Compatibility  *compat.Report `json:"compatibility,omitempty"`
+	// Release is the exemption-aware publish judgement in the unscoped
+	// context (only wildcard exemptions apply); the raw report above is
+	// never rewritten.
+	Release *ReleaseDecision `json:"release,omitempty"`
 }
 
 type CheckRequest struct {
@@ -41,6 +45,10 @@ type CheckResponse struct {
 	HeadVersion    string          `json:"head_version"`
 	Report         *compat.Report  `json:"report"`
 	ConsumerImpact *ConsumerImpact `json:"consumer_impact,omitempty"`
+	// Release is the exemption-aware publish judgement: raw verdict next
+	// to the effective verdict after applying active exemptions for the
+	// check's consumer context.
+	Release *ReleaseDecision `json:"release"`
 }
 
 type ConsumerImpact struct {

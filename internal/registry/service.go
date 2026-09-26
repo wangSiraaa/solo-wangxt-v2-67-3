@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -18,10 +19,13 @@ import (
 // (via Store) holds packages, versions and consumer declarations.
 type Service struct {
 	store Store
+	// now is the clock for expiry evaluation and timestamps; tests
+	// substitute a fixed clock to exercise time boundaries.
+	now func() time.Time
 }
 
 func NewService(store Store) *Service {
-	return &Service{store: store}
+	return &Service{store: store, now: time.Now}
 }
 
 // RegisterVersion compiles the submitted sources, refuses to overwrite an
@@ -43,15 +47,23 @@ func (s *Service) RegisterVersion(ctx context.Context, req *connect.Request[Regi
 	base, baseErr := s.resolveBase(ctx, r.Package, r.Version, r.BaseVersion)
 
 	var report *compat.Report
+	var release *ReleaseDecision
 	if baseErr == nil && base != nil {
 		report, err = s.checkAgainst(ctx, base, compiled, r.Samples)
 		if err != nil {
 			return nil, err
 		}
-		if r.RequireCompatible && report.Verdict == compat.VerdictIncompatible {
+		// The publish gate judges the exemption-aware decision in the
+		// unscoped context: only wildcard ("*") exemptions can lift a
+		// proven INCOMPATIBLE here; consumer-scoped ones never do.
+		release, err = s.releaseDecision(ctx, r.Package, "", report.Findings)
+		if err != nil {
+			return nil, err
+		}
+		if r.RequireCompatible && release.EffectiveVerdict == compat.VerdictIncompatible {
 			return nil, connect.NewError(connect.CodeFailedPrecondition,
-				fmt.Errorf("version %s is proven incompatible with %s (%d FAIL findings); registration refused, nothing stored",
-					r.Version, base.Version, countSeverity(report, compat.SeverityFail)))
+				fmt.Errorf("version %s is proven incompatible with %s (%d FAIL findings, raw verdict %s, effective verdict %s); registration refused, nothing stored",
+					r.Version, base.Version, countSeverity(report, compat.SeverityFail), report.Verdict, release.EffectiveVerdict))
 		}
 	}
 
@@ -82,6 +94,7 @@ func (s *Service) RegisterVersion(ctx context.Context, req *connect.Request[Regi
 		ContentHash:    hex.EncodeToString(compiled.Hash),
 		AlreadyExisted: !created,
 		Compatibility:  report,
+		Release:        release,
 	}
 	if base != nil {
 		resp.BaseVersion = base.Version
@@ -140,13 +153,23 @@ func (s *Service) CheckCompatibility(ctx context.Context, req *connect.Request[C
 	}
 
 	resp := &CheckResponse{BaseVersion: base.Version, HeadVersion: headVersion, Report: report}
+	// The release decision is evaluated over the same finding set the
+	// caller sees: the consumer projection when a consumer is named,
+	// the full report otherwise.
+	considered := report.Findings
 	if r.Consumer != "" {
 		impact, err := s.consumerImpact(ctx, r.Package, r.Consumer, report)
 		if err != nil {
 			return nil, err
 		}
 		resp.ConsumerImpact = impact
+		considered = impact.Findings
 	}
+	release, err := s.releaseDecision(ctx, r.Package, r.Consumer, considered)
+	if err != nil {
+		return nil, err
+	}
+	resp.Release = release
 	return connect.NewResponse(resp), nil
 }
 

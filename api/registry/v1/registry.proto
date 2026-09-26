@@ -28,6 +28,26 @@ service Registry {
 
   // ListVersions returns every registered version of a package.
   rpc ListVersions(ListVersionsRequest) returns (ListVersionsResponse);
+
+  // RequestExemption files a PENDING, time-bound exemption for one finding
+  // of a stored report. It has no effect until a different identity
+  // approves it. Supplying request_id makes retries idempotent.
+  rpc RequestExemption(RequestExemptionRequest) returns (RequestExemptionResponse);
+
+  // ApproveExemption activates a PENDING exemption. The requester may not
+  // approve their own request (PermissionDenied). The transition is
+  // guarded by expected_version: a stale version fails with Aborted.
+  // Repeating an already-applied approval by the same approver is an
+  // idempotent success.
+  rpc ApproveExemption(ApproveExemptionRequest) returns (ApproveExemptionResponse);
+
+  // RevokeExemption withdraws an exemption; the next check blocks the
+  // finding again. Revoking an already-revoked exemption is idempotent.
+  rpc RevokeExemption(RevokeExemptionRequest) returns (RevokeExemptionResponse);
+
+  // ListExemptions returns the exemptions of a package. Statuses are
+  // effective at read time: APPROVED past expires_at reports as EXPIRED.
+  rpc ListExemptions(ListExemptionsRequest) returns (ListExemptionsResponse);
 }
 
 message ProtoFile {
@@ -72,6 +92,10 @@ message RegisterVersionResponse {
   bool already_existed = 4;
   string base_version = 5;
   Report compatibility = 6;
+  // Exemption-aware publish judgement in the unscoped context (only
+  // wildcard "*" exemptions apply). The require_compatible gate refuses
+  // registration when release.effective_verdict is INCOMPATIBLE.
+  ReleaseDecision release = 7;
 }
 
 message CheckRequest {
@@ -88,6 +112,100 @@ message CheckResponse {
   string head_version = 2;
   Report report = 3;
   ConsumerImpact consumer_impact = 4;
+  // Exemption-aware publish judgement for the check's consumer context
+  // (unscoped when no consumer was named). The raw report above is never
+  // rewritten; expired, revoked or fingerprint-mismatched exemptions
+  // simply do not apply.
+  ReleaseDecision release = 5;
+}
+
+// ReleaseDecision states what the findings mean for a release after
+// applying active exemptions, alongside the untouched raw verdict.
+message ReleaseDecision {
+  string consumer = 1;           // evaluation context; "" = unscoped
+  string raw_verdict = 2;        // verdict before exemptions
+  string effective_verdict = 3;  // verdict after active exemptions
+  repeated FindingDecision findings = 4;
+}
+
+message FindingDecision {
+  string fingerprint = 1;  // semantic identity of the finding
+  string code = 2;
+  string severity = 3;     // original severity, never rewritten
+  bool exempted = 4;
+  string exemption_id = 5;
+}
+
+// Exemption is a time-bound, consumer-scoped waiver for one finding
+// fingerprint. Status: PENDING | APPROVED | REVOKED, plus EXPIRED derived
+// at read time from expires_at. version is the optimistic-concurrency
+// token required by ApproveExemption/RevokeExemption.
+message Exemption {
+  string id = 1;
+  string package = 2;
+  string fingerprint = 3;
+  Finding finding = 4;      // snapshot at request time
+  string base_version = 5;  // report the request was anchored to
+  string head_version = 6;
+  string owner = 7;
+  string reason = 8;
+  repeated string consumers = 9; // "*" covers every consumer and unscoped checks
+  string requested_by = 10;
+  string approved_by = 11;
+  string revoked_by = 12;
+  string status = 13;
+  string expires_at = 14;   // RFC3339
+  string request_id = 15;
+  int64 version = 16;
+  string created_at = 17;
+  string updated_at = 18;
+}
+
+message RequestExemptionRequest {
+  string package = 1;
+  string base_version = 2;
+  string head_version = 3;
+  string fingerprint = 4;   // FindingDecision.fingerprint from a check
+  string owner = 5;
+  string reason = 6;
+  repeated string consumers = 7;
+  string expires_at = 8;    // RFC3339, must be in the future
+  string requested_by = 9;
+  string request_id = 10;   // optional idempotency key
+}
+
+message RequestExemptionResponse {
+  Exemption exemption = 1;
+}
+
+message ApproveExemptionRequest {
+  string id = 1;
+  int64 expected_version = 2;
+  string approver = 3;      // must differ from the exemption's requested_by
+}
+
+message ApproveExemptionResponse {
+  Exemption exemption = 1;
+}
+
+message RevokeExemptionRequest {
+  string id = 1;
+  int64 expected_version = 2;
+  string revoker = 3;
+  string reason = 4;
+}
+
+message RevokeExemptionResponse {
+  Exemption exemption = 1;
+}
+
+message ListExemptionsRequest {
+  string package = 1;
+  bool include_inactive = 2; // also list pending, expired and revoked
+}
+
+message ListExemptionsResponse {
+  repeated Exemption exemptions = 1;
 }
 
 message ConsumerImpact {
